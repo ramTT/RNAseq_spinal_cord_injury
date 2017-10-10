@@ -1,0 +1,1246 @@
+---
+title: "DGE post SCI and MSC Treatment"
+author: "Ramil Hakim"
+date: "`r format(Sys.time(), '%d %B %Y')`"
+output: 
+  html_document:
+    theme: flatly
+    toc: true
+    number_sections: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Project Description
+
+**Hypothesis:** _Transplantation of syngeneic bone-marrow derived mesenchymal stem cells (BMSCs) has superior therapeutic effect in comparison to transplantation of allogenic BMSCs following experimental spinal cord inury (SCI) in mouse._  
+
+**Experimental setup & sequencing:** C57BL/6J female mice underwent a severe (75 kdyn) contusion SCI followed by transplantation of bMSCs 24 h post SCI. Animals were sacrificed 20 days following SCI. Total RNA, digested of DNase, was isolated and sequenced (125 cycles paired-end) in one lane using the HiSeq2500 system and v4 sequencing chemistry (Illumina Inc.) performed by the SNP&SEQ Technology Platform (Uppsala, Sweden).   
+
+**Data analysis:** A read count matrix was obtained from the sequencing core facility. Data was analyed using the edgeR and limma packages (both available through bioconductor.org) using R version 3.3.2. Two additional key packages used were ggplot2 and data.table.    
+
+***
+
+# Data Overview
+
+```{r echo=F, warning=F, message=F, error=F}
+#1. Installing packages
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("limma")
+
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("edgeR")
+
+# source("https://bioconductor.org/biocLite.R")
+# biocLite("Mus.musculus")
+
+#install.packages("data.table")
+#install.packages("ggplot2")
+#install.packages("cowplot")
+#install.packages("RColorBrewer")
+#install.packages("gplots")
+#install.packages("pvclust")
+#install.packages("VennDiagram")
+# install.packages("rafalib")
+#install.packages("grid")
+#install.packages("colorspace")
+#install.packages("ellipse")
+#install.packages("ggrepel")
+#install.packages("rafalib")
+#install.packages("boot")
+#install.packages("pvclust")
+#install.packages("RCurl")
+#install.packages("XML")
+#install.packages("xml2")
+
+library(RCurl)
+library(XML)
+library(xml2)
+
+#2. Attaching packages
+library(limma)
+library(edgeR)
+library(Mus.musculus)
+
+library(data.table)
+library(ggplot2)
+library(cowplot)
+library(gridExtra)
+library(grid)
+
+library(colorspace)
+library(RColorBrewer)
+library(gplots)
+library(VennDiagram)
+library(ellipse)
+library(ggrepel)
+library(rafalib)
+
+library(boot)
+library(pvclust)
+
+library(knitr)
+library(pander)
+
+rm(list=ls())
+
+#Importing function for sharing legend 
+source("/home/ramhak/Dropbox/PHD/PAPER I/R_v2/Function_directory/get_legend.R")
+```
+
+```{r echo=F, warning=F, message=F, error=F}
+############## IMPORTING DATA & ANNOTATING GENES & ORGANISING META DATA #############
+```
+
+**Table 1. Dataset characteristics**
+```{r echo=F, warning=F, message=F, error=F}
+#1. Importing read count matrix
+DT_read_count <- fread("merged_gene_counts.txt", header=T)
+
+#2. Retrieving gene annotations (SYMBOL) based on ENSEMBL_ID
+gene_annotations <- data.table(select(Mus.musculus, keys=DT_read_count[,as.character(ENSEMBL_ID)], columns="SYMBOL", keytype = "ENSEMBL"))
+
+#3. Removing duplicates in retrieved annotations
+gene_annotations <- gene_annotations[!duplicated(ENSEMBL)]
+
+#4. Adding gene annotations to read_count_matrix 
+DT_read_count <- merge(DT_read_count, gene_annotations, by.x="ENSEMBL_ID", by.y="ENSEMBL")
+DT_read_count <- setcolorder(DT_read_count, c(1,14,2:13))
+
+#5. Importing sample_key
+DT_meta_data <- fread("sample_key.csv")
+
+#6. Adjusting row order to fit the column order of the read_count_matrix
+DT_meta_data <- DT_meta_data[order(RH.index)]
+
+#7. Adding library size (=column sums)
+DT_meta_data <- DT_meta_data[,library.size:=colSums(DT_read_count[,-(1:2)])]
+
+#8. Adding normalisation factor (=1 initially)
+DT_meta_data <- DT_meta_data[,norm.factor:=1]
+
+#9. Defining factor variables
+factor_vars <- c("RH.index", "sample", "group")
+DT_meta_data[,factor_vars] <- DT_meta_data[,lapply(.SD, factor), .SDcols=factor_vars]
+
+###SECTION OUTPUT
+#Table with dataset characteristics
+pander(data.table(Characteristic=c("Samples (n):","Groups (n):","Unique ENSEMBL IDs (n):"), Value= c(ncol(DT_read_count[,-(1:2)]), length(unique(DT_meta_data[,group])), nrow(DT_read_count))), justify=c("left", "left"))
+```
+
+***
+# Data Pre-Processing
+## Transforming from raw scale and removing lowly expressed genes
+
+**Background:** The expression of a gene must reach a certain threshold for it to be translated into a protein. Translation into a protein is a prerequiste for a gene to have any biological function. Thus, genes with low number of read counts across samples are probably not differentially expressed and should be removed. However, a greater sequencing depth (i.e. a larger library size) will result in a higher read count, thus introducing a bias to the DGE analysis. Therefore, prior to filtering, raw counts are transformed into counts per million (CPM) which accounts for the difference in library size. 
+
+**Transformation:** Raw counts are transformed into CPM by dividing each count with the sum of the column (i.e. the library size) and then multiplying by 1e6. Log-CPM is calculated by taking log2 (raw count + 0.25).
+
+**Filtering:** Lowly expressed genes are removed from the count matrix by filtering. A gene is defined as highly expressed if CPM>1 for at least three samples. Three samples was chosen since it is equal to the smallest group size (which is equal between groups in this case).    
+
+**Fig 1. Density of log-CPM values pre -and post filtering**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=4, fig.width=12}
+#1. Creating log CPM matrix 
+DT_lcpm_unfiltered <- data.table(cpm(DT_read_count[,-c(1:2)], log=T, lib.size = colSums(DT_read_count[,-c(1:2)])))
+
+#2. Filtering out lowly expressed genes from read_count_matrix
+DT_read_count_filtered <- DT_read_count[rowSums(DT_lcpm_unfiltered>0)>=3]
+
+#3. Calculating log cpm matrix 
+DT_lcpm <- cpm(DT_read_count_filtered[,-c(1:2)], log=T, lib.size = colSums(DT_read_count_filtered[,-c(1:2)]))
+
+#4. Melting data for plotting
+lcpm_unfiltered_plotdata <- suppressWarnings(melt.data.table(data.table(DT_lcpm_unfiltered), variable.name="sample", value.name = "lcpm"))
+lcpm_filtered_plotdata <- suppressWarnings(melt.data.table(data.table(DT_lcpm), variable.name="sample", value.name = "lcpm"))
+
+#5. Plotting function
+logCPM_density_plot_function <- function(plot.data, type, legend.type){
+  logCPM_density_plot_out <- ggplot(plot.data, aes(x=lcpm, color=sample))+
+  geom_line(stat="density", size=1.25)+
+  geom_vline(xintercept=0, linetype=2)+
+
+  scale_x_continuous(breaks=seq(-10,16,2), limits=c(-8,16))+
+  scale_y_continuous(breaks=seq(0,0.45,0.05), limits=c(0,0.45))+
+  scale_color_manual(values=diverge_hcl(12, c=100, l=c(50,90), power=1), name="Sample")+
+  annotate("text", x=5, y=0.4, label=type, size=7.5, alpha=0.6)+
+  annotate("text", x=5, y=0.35, label=paste("Genes (n):", toString(unique(plot.data[,.N, by="sample"][,N]))), fontface=2, size=4)+
+  theme(legend.position=legend.type, axis.title = element_blank())
+  
+  if(type =="RAW"){
+    logCPM_density_plot_out <- logCPM_density_plot_out + annotate("text", x=-8, y=0.45, label="A", size=7.5, fontface=2) 
+  } else if(type=="FILTERED"){
+    logCPM_density_plot_out <- logCPM_density_plot_out + annotate("text", x=-8, y=0.45, label="B", size=7.5, fontface=2)
+  }
+
+  return(logCPM_density_plot_out)  
+}
+
+density_raw_plot <- logCPM_density_plot_function(lcpm_unfiltered_plotdata, "RAW","right")
+density_legend <- get_legend(density_raw_plot)
+density_raw_plot <- logCPM_density_plot_function(lcpm_unfiltered_plotdata, "RAW","none")
+density_filtered_plot <- logCPM_density_plot_function(lcpm_filtered_plotdata, "FILTERED","none")
+
+###SECTION OUTPUT
+grid.arrange(density_raw_plot, density_filtered_plot, density_legend, ncol=3, widths=c(3,3,0.4), bottom=textGrob("log-CPM", gp=gpar(fontsize=17, fontface="bold")), left=textGrob("Density", gp=gpar(fontsize=17, fontface="bold"), rot=90))
+```
+
+**Fig 1.** _Figure reports the density of log-CPM for every sample (by color) pre -and post filtering of lowly expressed genes. Filtering is conducted using log-CPM values. Vertical dashed line represents the cut off (log-CPM=0). The figure shows a distinct shift of the density from below the threshold (Fig 1A) to above the threshold (Fig 1B)._  
+
+***
+##Normalizing gene expression distributions
+
+**Background:** The read count is affected by: 1) the gene expression and 2) the sequencing depth. The sequencing depth equals the library size. The library size is defined as the sum of counts for each sample (i.e. column sum). The counts per sample represent the relative abundance of each gene. Highly expressed genes can consume a substantial proportion of the library size thus making the other genes seem underexpressed. Therefore, normalization is conducted in order to ensure that the distribution of the expression is similar for each sample. All samples should have a smiliar range and distribution of expression (log-CPM). 
+
+**Normalization:** Scaling factors are calculated using the trimmed mean of M-values (TMM). The algorithm finds a set of scaling factors which minimizes the log-fold change between the samples. Scaling factors >1 downscale the counts while scaling factors <1 scale the counts upwards. The effective library size is then obtained by taking the product of the original library size and the scaling factor for each sample respectively.  
+
+```{r echo=F, warning=F, message=F, error=F}
+############## NORMALISING GENE EXPRESSION DISTRIBUTIONS #############
+```
+
+```{r echo=F, warning=F, message=F, error=F}
+#1. Calculating norm.factors using TMM method and adding to meta_data
+DT_meta_data <- DT_meta_data[,norm.factor.tmm:=calcNormFactors(DT_read_count_filtered[,-(1:2)], method = "TMM")]
+
+#2. Calculating adjusted library sizes in meta_data
+DT_meta_data <- DT_meta_data[,effective.library.size:=library.size*norm.factor.tmm]
+```
+
+**Fig 2. Distribution of log-CPM pre -and post normalization**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=5, fig.width=12}
+#1. Calculating log2 of read_count_matrix with unadjusted and adjusted library size respectively
+lcpm_temp_notNormalised <- cpm(DT_read_count_filtered[,-(1:2)], log=T, lib.size = DT_meta_data[,library.size])
+lcpm_temp <- cpm(DT_read_count_filtered[,-(1:2)], log=T, lib.size = DT_meta_data[,effective.library.size])
+#2. Adding id columns and creating data.tables
+DT_lcpm_notNormalised <- data.table(DT_read_count_filtered[,c(1:2)], lcpm_temp_notNormalised)
+DT_lcpm <- data.table(DT_read_count_filtered[,c(1:2)], lcpm_temp)
+#3. Creating plotting data
+DT_lcpm_notNormalised_melt <- melt.data.table(DT_lcpm_notNormalised, id.vars=c("ENSEMBL_ID", "SYMBOL"), variable.name = "sample")
+DT_lcpm_melt <- melt.data.table(DT_lcpm, id.vars=c("ENSEMBL_ID", "SYMBOL"), variable.name = "sample")
+#4. Plotting function for gene expression distribution of 
+log_cpm_distribution_function <- function(dataset, type){
+  log_cpm_distribution_plot <- ggplot(dataset, aes(sample,value, color=sample))+
+  geom_jitter(DT_lcpm_notNormalised_melt[,.(value=sample(value,10000)), by="sample"], mapping=aes(sample, value),alpha=0.05)+
+  geom_boxplot(size=1, color="black", alpha=0)+
+
+  scale_y_continuous(limits=c(-8,20), breaks=seq(-10,20,2))+
+  scale_fill_manual(values=diverge_hcl(12, c=100, l=c(50,90), power=1), name="Sample:")+
+  scale_color_manual(values=diverge_hcl(12, c=100, l=c(50,90), power=1), name="Sample:")+
+    
+  theme(legend.position = "none", axis.title = element_blank())+
+  annotate("text", x=6.5, y=18, label=type, size=7.5, alpha=0.6)
+  
+  if(type =="RAW"){
+    log_cpm_distribution_plot <- log_cpm_distribution_plot + annotate("text", x=1, y=20, label="A", size=7.5, fontface=2)
+  } else if(type=="NORMALIZED"){
+    log_cpm_distribution_plot <- log_cpm_distribution_plot + annotate("text", x=1, y=20, label="B", size=7.5, fontface=2)
+  }
+
+  return(log_cpm_distribution_plot)
+  
+}
+
+###SECTION OUTPUT
+grid.arrange(log_cpm_distribution_function(DT_lcpm_notNormalised_melt, "RAW"), log_cpm_distribution_function(DT_lcpm_melt, "NORMALIZED"), ncol=2, bottom=textGrob("Sample", gp=gpar(fontsize=17, fontface="bold")), left=textGrob("log-CPM", gp=gpar(fontsize=17, fontface="bold"), rot=90))
+```
+
+**Fig 2.** _Figure reports the distribution of gene expression (log-CPM) for each sample. Fig 2A reports the distribution prior to normalization while Fig 2B reports the distribution following normalization of library sizes using trimmed means of M-values. Boxplots are based on all log-CPM values while points represent a random sample of 1e4 observations (due to processing time issues). The difference in the distribution of log-CPM using original and effective library sizes is minor but adjusted for._
+
+***
+
+```{r echo=F, warning=F, message=F, error=F}
+########################################### UNSUPERVISED LEARNING 1: PCA ############################################
+```
+
+# Unsupervised Clustering 1: PCA
+
+**Principal component analysis (PCA):** A PCA aims at producing a low-dimensional representation of the dataset. The principal components are each normalized linear combinations of a set of features constructed with loadings with the intention to achieve maximal variance. Normalized means that the sum of squared loadings equals one. Furthermore, the principal components are constructed to be uncorrelated to each other.  
+
+**Fig 3. Variance explained by principal components based on the 500 genes with highest variance**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=6, fig.width=12}
+#1. Calculating the variance for each gene
+gene_variance <- data.table(DT_lcpm[,c(1:2)],variance=apply(DT_lcpm[,-(1:2)],1,var))
+
+#2. Selecting the 500 genes with highest variance 
+gene_variance_top500 <- gene_variance[order(-variance)][1:500]
+
+#3. Calculating principal components for the genes with highest variance (top 500) from DT_lcpm
+setkey(DT_lcpm, ENSEMBL_ID)
+DT_principal_comp_raw <- prcomp(t(DT_lcpm[ENSEMBL_ID %in% gene_variance_top500[,ENSEMBL_ID],-(1:2)]))
+DT_principal_comp_summary <- data.table(sd=summary(DT_principal_comp_raw)$sdev)
+
+#4. Subsetting data for plotting
+DT_principal_comp <- data.table(RH.index=factor(rownames(DT_principal_comp_raw$x)), DT_principal_comp_raw$x)
+
+#5. Merging with meta_data 
+DT_principal_comp <- merge(DT_principal_comp, DT_meta_data[,c(1:3)], by="RH.index")
+
+#6. Calculating proportion of explained variance 
+DT_principal_comp_summary <- DT_principal_comp_summary[,var:=sd**2][,var.prop:=var/sum(var)][,var.prop.cumsum:=cumsum(var.prop)]
+
+#7. Plotting function: explained variance per component (proportional and cumulative)
+PCA_plot_prop.var_function <- function(dataset, yvariable,color){
+  explained_var_plot <- ggplot(dataset, aes(1:12,get(yvariable)))+
+  geom_bar(stat="identity", fill=brewer.pal(11, "RdBu")[color], alpha=0.9, width=0.7)+
+  geom_point(size=4, shape=18)+
+  geom_line(linetype=2, size=1.5)+
+  geom_text(aes(label=format(round(get(yvariable),2), digits = 2)), vjust=-1, fontface="bold", size=4)+
+  
+  scale_x_discrete(limits=seq(1,12,1))+
+  scale_y_continuous(breaks=seq(0,1,0.1), limits=c(0,1.1))+
+  theme(axis.title= element_blank())
+  
+  if(yvariable=="var.prop"){
+    explained_var_plot <- explained_var_plot + annotate("text", x=1, y=1.1, label="A", fontface=2, size=7.5)+ annotate("text", x=6.5, y=1.1, label="PROPORTIONAL", size=7.5, alpha=0.6)
+  } else if(yvariable=="var.prop.cumsum"){
+    explained_var_plot <- explained_var_plot + annotate("text", x=1, y=1.1, label="B", fontface=2, size=7.5)+annotate("text", x=6.5, y=1.1, label="CUMULATIVE", size=7.5, alpha=0.6)
+  }
+  
+  return(explained_var_plot)
+}
+
+#8. Subsetting log CPM using the 500 genes with highest variance
+DT_pca_sim <- DT_lcpm[ENSEMBL_ID %in% gene_variance_top500[,ENSEMBL_ID],-(1:2)]
+
+#9. Boostrapping proportion of variance for each principal component   
+DT_pca_boot_conf <- boot(DT_pca_sim, function(dataset, b){summary(prcomp(t(dataset[b])))$importance[2,]},1000)
+
+#10. Extracting 95 % confidence intervals from bootstrapped data (not for PC 12 since 0 throughout)
+DT_pca_boot_conf_summary <- suppressWarnings(data.table(do.call(rbind, lapply(1:11, function(column){boot.ci(DT_pca_boot_conf, type="bca", index=column)$bca[(4:5)]}))))
+names(DT_pca_boot_conf_summary) <- c("CI.Lower", "CI.Upper")
+
+#11. Converting bootstrapped data into plotable data 
+DT_pca_boot_conf_plotdata <- data.table(DT_pca_boot_conf$t)
+names(DT_pca_boot_conf_plotdata) <- names(DT_pca_boot_conf$t0)
+DT_pca_boot_conf_plotdata <- suppressWarnings(melt.data.table(DT_pca_boot_conf_plotdata, variable.name = "PC.type"))
+
+#12. Plotting function for prop.var explained distribution
+pca_boot_conf_function <- function(data.set.conf){
+  pca_boot_conf_out <- ggplot(data.set.conf, aes(value, fill=PC.type))+
+  geom_rect(aes(xmin=DT_pca_boot_conf_summary[1,CI.Lower], xmax=DT_pca_boot_conf_summary[1,CI.Upper], ymin=0, ymax=100), fill="grey", alpha=0.05)+
+  geom_histogram(alpha=0.7, bins=40, position="identity")+
+  
+  scale_fill_manual(values=brewer.pal(11, "RdBu"))+
+  
+  theme(legend.title = element_blank(), legend.position = "right", axis.title = element_blank())
+  
+  if(data.set.conf[,PC.type][1]!="PC1"){
+    pca_boot_conf_out <- pca_boot_conf_out + scale_x_continuous(breaks=seq(0,0.08,0.01), limits = c(0,0.08))+scale_y_continuous(breaks=seq(0,1100,100), limits=c(0,1100))+annotate("text", x=0.005, y=1100, label="B", size=7.5, fontface=2)
+  } else if(data.set.conf[,PC.type][1]=="PC1"){
+    pca_boot_conf_out <- pca_boot_conf_out + scale_x_continuous(breaks=seq(0.75,0.85,0.01))+scale_y_continuous(breaks=seq(0,110,10), limits=c(0,110))+annotate("text", x=0.755, y=110, label="A", size=7.5, fontface=2)+annotate("text", x=0.8, y=110, label=paste("95 % CI:\n",toString(round(DT_pca_boot_conf_summary[1,CI.Lower],2)), "-", round(DT_pca_boot_conf_summary[1,CI.Upper],2)), size=4, fontface=2)
+  }
+
+  return(pca_boot_conf_out)
+}
+
+###SECTION OUTPUT
+grid.arrange(PCA_plot_prop.var_function(DT_principal_comp_summary,"var.prop",1),PCA_plot_prop.var_function(DT_principal_comp_summary,"var.prop.cumsum",11), ncol=2, bottom=textGrob("Principal component", gp=gpar(fontsize=17, fontface="bold")), left=textGrob("Proportion variance explained", gp=gpar(fontface="bold", fontsize=17), rot=90))
+```
+
+**Fig 3.** _Figure reports the proportion variance explained by each principal component. Fig 3A reports the proportional variance explained by each component while Fig 3B reports the cumulative variance explained by the components. It is obvious that the first principal component explains the majority of the variance while the remaining components explain only a small portion of the variance._
+
+**Fig 4. Estimation of distribution of the variance explained by the principal components **
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=6, fig.width=12}
+grid.arrange(pca_boot_conf_function(DT_pca_boot_conf_plotdata[PC.type=="PC1"]),pca_boot_conf_function(DT_pca_boot_conf_plotdata[PC.type!="PC1"]), ncol=2, bottom=textGrob("Proportional variance explained", gp=gpar(fontsize=17, fontface="bold")),left=textGrob("Count (n)", gp=gpar(fontface="bold", fontsize=17), rot=90))
+```
+
+**Fig 4.** _Figure reports the distribution of bootstrapped proportion of variance explained by each principal component. Bootstrap is conducted using the 500 genes with the highest variance. Fig 4A reports the distribution for the first principal component while Fig 4B reports the distribution for the remaining eleven components (due to differences in magnitude). Shaded region in Fig 4A represents a bootstrapped nonparametric 95 % confidence interval. The histograms show narrow distributions which confirms the observations and conclusion in Fig 3._
+
+**Table 2. Upper and lower bounds (95 % confidence interval) for the proportion of variance explained by principal component 1 to 11 **
+```{r echo=F, warning=F, message=F, error=F, fig.height=6, fig.width=12}
+kable(data.table("bound"=c("Upper bound :", "Lower bound:"),t(round(DT_pca_boot_conf_summary,3))), col.names = names(c(" ",DT_pca_boot_conf$t0[1:11])), align="c")
+```
+
+***
+
+**Fig 5. Multidimensional scaling plot of the 500 genes with the highest variance**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=6, fig.width=10}
+#1. Creating data for ellipses
+ellipse_data <- suppressWarnings(do.call(rbind,lapply(split(DT_principal_comp, DT_principal_comp[,group]), function(group.object){data.table(group=group.object[,group],with(group.object, ellipse::ellipse(cor(PC1,PC2), scale = c(sd(PC1), sd(PC2)), centre=c(mean(PC1), mean(PC2)), t=1.5)))})))
+
+#2. Creating group_names to avoid repetition in plot
+group_names <- c("Allogenic mBMSC", "Injury Control", "Syngeneic mBMSC", "Uninjured")
+
+#3. Creating MDS plot
+PCA_plot_mds <- ggplot(DT_principal_comp, aes(PC1, PC2))+
+  geom_polygon(ellipse_data, mapping=aes(x,y, fill=group), alpha=0.2, show.legend = F)+
+  geom_point(aes(color=group, shape=group), size=7, alpha=1)+
+
+  xlab("Principal component 1")+
+  ylab("Principal component 2")+
+  
+  scale_color_manual(values=brewer.pal(11,"RdBu")[c(1,2,10,11)], labels=group_names)+
+  scale_shape_manual(values=c(18,17,16,15), labels=group_names)+
+  scale_fill_manual(values=brewer.pal(11,"RdBu")[c(1,2,10,11)], labels=group_names)+
+  scale_x_continuous(breaks=seq(-50,75,10))+
+  scale_y_continuous(breaks=seq(-20,30,5))+
+  
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text=element_text(size=20), legend.justification = "center", axis.title = element_text(size=22, face="bold"))+
+  
+  annotate("text", x=-35, y=7.5, label="Allogenic\nBMSCs", size=6, fontface=2)+
+  annotate("text", x=-35, y=-7.5, label="Injury\nControl", size=6, fontface=2)+
+  annotate("text", x=-2, y=-7.5, label="Syngeneic BMSCs", size=6, fontface=2)+
+  annotate("text", x=55, y=10, label="Uninjured", size=6, fontface=2)
+
+###SECTION OUTPUT
+PCA_plot_mds
+# ggsave("PCA_plot_mds.jpg", PCA_plot_mds, dpi=1000, height = 7, width=14)
+
+```
+
+**Fig 5.** _Figure reports the distribution of the samples along the first and second principal component. Study groups are indicated with ellipses. Ellipses represent a 95 % confidence interval based on the samples within each group. There is a distinct separation between the four study groups. Uninjured samples separate from the three other study groups which contain animals exposed to SCI. The syngeneic and allogenic groups do form an "venn diagram like" pattern in relation to the injury only group in the sense that they both have one animal which overlaps with the injury control study group._
+
+
+**Fig 6. K means clustering (4 groups) of 1000 boostrap replicates for the first -and second principal component for the 500 genes with the highest variance** 
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=6, fig.width=10}
+#1. Bootstrap function: boostrap from top 500 genes with highest variance and calculate PC1 and PC2 
+pca_simulation_function <- function(dataset, run){
+  sim_data <- dataset[sample(1:500, replace = T)]
+  sim_prcomp_raw <- prcomp(t(sim_data))$x[,(1:2)]
+  sim_prcomp <- data.table(sample=rownames(sim_prcomp_raw),sim_prcomp_raw)
+  return(sim_prcomp)
+}
+
+#2. Calling boostrap function, creating data table and merging with group name 
+DT_pca_boot <- do.call(rbind, lapply(1:1000, function(dataset,i){pca_simulation_function(DT_pca_sim,i)}))
+DT_pca_boot[, "sample"] <- factor(DT_pca_boot[,sample])
+DT_pca_boot <- merge(DT_pca_boot, DT_meta_data[,.(RH.index, group)], by.x="sample", by.y="RH.index")
+
+#3. Adding K-means clustering
+DT_pca_boot_kmeans <- kmeans(DT_pca_boot[,c(2,3)], 4, nstart=20)
+DT_pca_boot <- DT_pca_boot[,k.mean.cluster:=factor(DT_pca_boot_kmeans$cluster)]
+
+#4. K means clustering on original samples (raw data, not boostrapped)
+DT_pca_kmean_sample <- DT_principal_comp[,.(PC1,PC2, RH.index,sample, group)]
+DT_pca_kmean_sample <- DT_pca_kmean_sample[,k.mean.group:=factor(kmeans(DT_principal_comp[,.(PC1,PC2)], 4, nstart=20)$cluster)]
+
+#5. Creating ellipse data for bootstraped PCA data
+ellipse_data_boot <- do.call(rbind,lapply(split(DT_pca_boot, DT_pca_boot[,k.mean.cluster]), function(cluster){data.table(cluster=rep(unique(cluster[,k.mean.cluster]),100), with(cluster, (ellipse::ellipse(cor(PC1,PC2), scale = c(sd(PC1), sd(PC2)), centre=c(mean(PC1), mean(PC2))))))}))
+
+#6. Plotting function for bootstrapped PCA
+color_palette <- brewer.pal(11, "RdBu")[c(1,2,10,11)]
+
+PCA_sim_plot_function <- function(dataset, group.var){
+
+  PCA_sim_plot_out <- ggplot(dataset, aes(PC1, PC2))+
+  geom_polygon(ellipse_data_boot, mapping=aes(x,y, fill=cluster), alpha=0.2, show.legend = F)+
+  geom_jitter(aes(color=get(group.var)), alpha=0.2, size=2, width=1.5, show.legend = F)+
+  geom_point(DT_pca_kmean_sample, mapping=aes(PC1, PC2, shape=group), size=5)+
+  
+  xlab("Principal component 1")+
+  ylab("Principal component 2")+
+
+  scale_color_manual(values=color_palette)+
+  scale_fill_manual(values=color_palette)+
+  scale_shape_manual(values=c(18,17,16,15), labels=c("Allogenic mBMSC", "Injury Control", "Syngeneic mBMSC", "Uninjured"))+
+  scale_x_continuous(breaks=seq(-50,75,10))+
+  scale_y_continuous(breaks=seq(-30,35,5))+
+  
+  theme(legend.title = element_blank(), legend.position = "bottom", legend.text = element_text(size=20), legend.justification = "center", axis.title = element_text(size=22, face="bold"))+
+    
+  annotate("text", x=-40, y=35, label="K1", fontface=4, size=6)+
+  annotate("text", x=-20, y=13, label="K2", fontface=4, size=6)+
+  annotate("text", x=10, y=24, label="K3", fontface=4, size=6)+
+  annotate("text", x=65, y=35, label="K4", fontface=4, size=6)
+    
+  return(PCA_sim_plot_out)
+  
+}
+
+###SECTION OUTPUT
+PCA_sim_plot_function(DT_pca_boot, "k.mean.cluster")
+# ggsave("PCA_plot_boot.jpg",PCA_sim_plot_function(DT_pca_boot, "k.mean.cluster"), dpi=1000, width=14, height=7)
+
+```
+
+**Fig 6.** _Figure reports the first and second principal component for 1000 bootstrapped replicates per sample based on the 500 genes with highest variance. K means clustering with 4 groups and 20 starts was conducted on both the bootstrapped data. Ellipses are centered around the mean value of the botstrapped values for each cluster and represent a 95 % confidence interval for the data in each cluster. The clustering confirms the hypothesis postulated in Fig 5._ 
+
+**Fig 7. Top 10 positive and negative loadings for the first -and second principal component**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=5, fig.width=12}
+#1. Selecting PC1 and PC2 and adding gene names 
+DT_loadings <- data.table(SYMBOL=gene_variance_top500[,SYMBOL], DT_principal_comp_raw$rotation[,(1:2)])
+
+#2. Creating table data
+DT_loadings_sub_function <- function(data.load, pc.type, n){
+  load_out <- data.load[,.(SYMBOL, get(pc.type))][order(V2)]
+  load_out <- rbind(tail(load_out, n), head(load_out, n))
+  load_out[,"V2"] <- round(load_out[, V2],3)
+  load_out <- load_out[ ,PC.type:=pc.type]
+  names(load_out) <- c("Gene", "PC.value", "PC.type")
+  return(load_out)  
+}
+
+DT_loadings_plotdata <- rbind(DT_loadings_sub_function(DT_loadings[!is.na(SYMBOL)],"PC1", 10), DT_loadings_sub_function(DT_loadings[!is.na(SYMBOL)],"PC2", 10))
+
+#3. Adding a type variable for plotting purposes
+DT_loadings_plotdata <- DT_loadings_plotdata[,sign.type:=factor(ifelse(PC.value>0,"pos","neg"))]
+
+#4. Plotting function
+DT_loadings_plot_function <- function(data.set.loading, pc.type){
+  data.set.loading <- data.set.loading[PC.type==pc.type]
+  data.set.loading[,"Gene"] <- factor(data.set.loading[, Gene], levels=unique(data.set.loading[,Gene]))
+  
+  DT_loadings_out <- ggplot(data.set.loading, aes(Gene, PC.value, fill=PC.type))+
+  geom_bar(aes(alpha=sign.type), stat="identity", show.legend = F)+
+  geom_text(data.set.loading[PC.value>0], mapping=aes(label=round(PC.value,2)), hjust=-0.5, fontface=2, size=5)+
+  geom_text(data.set.loading[PC.value<0], mapping=aes(label=round(PC.value,2)), hjust=1.5, fontface=2, size=5)+
+  geom_segment(aes(x=0, xend=20, y=0, yend=0), size=2, linetype=2)+
+  coord_flip()+
+  
+  scale_y_continuous(breaks=seq(-0.2,0.2,0.02))+
+  scale_alpha_manual(values=c(0.7,0.9))+
+  
+  theme(axis.text.x = element_text(size=18), axis.title.x = element_text(face="bold", size=22), axis.title.y = element_blank(), axis.text.y = element_text(size=15))
+  
+  if(pc.type=="PC1"){
+    DT_loadings_out <- DT_loadings_out+scale_fill_manual(values=brewer.pal(11, "RdBu")[1])+annotate("text", x=20, y=-0.10, label="A", size=7.5, fontface=2) + ylab("Principal component 1")
+  } else if(pc.type=="PC2"){
+    DT_loadings_out <- DT_loadings_out+scale_fill_manual(values=brewer.pal(11, "RdBu")[11])+annotate("text", x=20, y=-0.19, label="B", size=7.5, fontface=2)+ylab("Principal component 2")
+  }
+  
+  return(DT_loadings_out)
+}
+
+###SECTION OUTPUT
+grid.arrange(DT_loadings_plot_function(DT_loadings_plotdata, "PC1"), DT_loadings_plot_function(DT_loadings_plotdata,"PC2"), ncol=2, left=textGrob("Gene", gp=gpar(fontface="bold", fontsize=17), rot=90))
+
+# #Saving loadings plot for PC1
+# ggsave("loadings_plot.jpg",DT_loadings_plot_function(DT_loadings_plotdata, "PC1"), dpi=1000, width=14, height=7)
+
+```
+
+**Fig 7.** _Figure reports the top 10 positive and negative loadings for the first -and second principal component._ 
+
+**Fig 8. Hierarchical clustering of samples based on 1000 genes with highest variance** 
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=5}
+#1. Selecting the 1000 genes with highest variance 
+gene_variance_top1000 <- gene_variance[order(-variance)][1:1000]
+#2. Creating a dissimilarity structure for the 100 genes with highest variance
+setkey(DT_lcpm, ENSEMBL_ID)
+DT_dist <- dist(t(DT_lcpm[ENSEMBL_ID %in% gene_variance_top1000[,ENSEMBL_ID],-(1:2)]))
+#3. Hierarchicla clustering on on the dissimilarity structure
+DT_hclust <- hclust(DT_dist)
+#4. Plotting the hierarchical clustering (with labels and adding color by group)
+myplclust(DT_hclust, labels = paste(DT_meta_data[,group]," ","(", DT_meta_data[,RH.index],")", sep=""), main="", ylab="", lab.col=brewer.pal(11, "RdBu")[c(1,2,10,11)][as.numeric(DT_meta_data[,group])], font=2, cex=1, hang=0.05)
+
+# #Saving
+# jpeg('PCA_hierarchical.jpg',
+#      width=1400,
+#      height=700,
+#      quality=1000)
+# myplclust(DT_hclust, labels = paste(DT_meta_data[,group]," ","(", DT_meta_data[,RH.index],")", sep=""), main="", ylab="", lab.col=brewer.pal(11, "RdBu")[c(1,2,10,11)][as.numeric(DT_meta_data[,group])], font=2, cex=1, hang=0.05)
+# dev.off()
+
+```
+
+**Fig 8.** _Figure reports a dendrogram which illustrates hierarchical clustering of samples based on the 1000 genes with the highest variance. Uninjured animals and animals which received allogenic transplantation cluster together and separately. The injured only animals and one of the syngeneic animals cluster together which supports the intercept like pattern observed in the PCA._ 
+
+***
+#Negative Binominal Dispersions by Weighted Likelihood Empirical Bayes  
+
+**Fig 9. Cox-Reid profile-adjusted likelihood estimated tagwise, common and trended dispersions**
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=5}
+#1. Setting up a design matrix (a dummy matrix indicating which group each sample belongs to)
+DT_design <- model.matrix(~0+DT_meta_data[,group])
+colnames(DT_design) <- levels(DT_meta_data[,group])
+
+#2. Estimating dispersions (common, trended and tagwise)
+DT_dispersion <- estimateDisp(DGEList(DT_read_count_filtered[,-(1:2)], lib.size = DT_meta_data[,effective.library.size]), design = DT_design, trend.method = "loess")
+
+DT_dispersion_tagwise <- data.table(DT_dispersion$AveLogCPM, DT_dispersion$tagwise.dispersion)
+names(DT_dispersion_tagwise) <- c("average.logCPM", "tagwise")
+
+#3. Plotting dispersions
+plot_dispersion <- ggplot(DT_dispersion_tagwise, aes(average.logCPM, tagwise))+
+  geom_point(alpha=0.3)+
+  geom_smooth(color="dodgerblue2", se=F, span=2, method="loess", size=1.2)+
+  geom_segment(aes(x=-1.25, xend=14.5, y=DT_dispersion$common.dispersion, yend=DT_dispersion$common.dispersion), color="red", size=1.25)+
+
+  xlab("Average log-CPM")+
+  ylab("Biological coefficient of variation (BCV)")+
+  
+  scale_y_continuous(limits=c(-0.1,1), breaks=seq(-0.1,1,0.1))+
+  scale_x_continuous(breaks=seq(-1,15,1))+
+  
+  annotate("text", x=12.5, y=0.9, label="Common", fontface=2, color="red")+
+  annotate("text", x=12.5, y=0.85, label="Trended", fontface=2, color="dodgerblue2")+
+  annotate("text", x=12.5, y=0.8, label="Tagwise", fontface=2, color="black")+
+  
+
+  theme(axis.title.x = element_text(face="bold", size=17), axis.title.y = element_text(face="bold", size=14))
+  
+####SECION OUTPUT
+plot_dispersion
+```
+
+**Fig 9. ** _Figure reports tagwise, common and trended dispersions._
+
+***
+
+```{r echo=F, warning=F, message=F, error=F}
+########################################### Removing heteroscedasticity ############################################
+```
+
+# Linear Modelling and Empirical Bayes Moderation Using Precision Weights 
+
+**Background:** The variance of raw counts is not independent of its mean. Furthermore, the variance of raw counts increases with the count size (opposite is true for log-counts). 
+
+**Voom transformation:** Acronym for mean-variance modelling at the observational level. The mean-variance relationship is estimated in the data which is then used for computing precision weights for each gene. The precision weights are then implemented in the linear modelling in order to adjust for heteroscedasticity. Estimation of precision weights is done as follows: 1) log-CPM=log2(raw count + 0.5), 2) a linear modelled is fitted to each gene, 3) lowess function is fitted to the scatterplot between average log-CPM and sqrt(st.dev), 4) the variance of the log-CPM for each gene is predicted using the lowess trend line 5) the inverse of the variance for each log-CPM value is the precision weight.     
+
+**Empirical Bayes moderation of standard error:** Ranks genes in order of evidence of differential expression. 
+
+**Fig 10. Mean-variance relationship pre -and post voom transformation**
+
+```{r echo=F, warning=F, message=F, error=F, fig.height=4, fig.width=12}
+#2. Setting up a contrast matrix for pairwise comparisons
+DT_contrast <- makeContrasts(
+  injury_syngeneic = injury-syngeneic,
+  injury_allogenic = injury-allogenic,
+  injury_uninjured = injury-uninjured,
+  syngeneic_allogenic = syngeneic-allogenic,
+  syngeneic_uninjured = syngeneic-uninjured,
+  allogenic_uninjured = allogenic-uninjured,
+  levels = colnames(DT_design)
+)
+
+#3. Plotting effective library size to see the variability
+library_size_plot_function <- function(data.set){
+  data.set <- data.set[order(-effective.library.size)]
+  data.set[, "sample"] <- factor(data.set[,sample], levels=unique(data.set[, sample]))
+  
+  library_size_plot_out <- ggplot(data.set, aes(sample, effective.library.size, fill=sample))+
+    geom_bar(stat="identity", show.legend = F)+
+    geom_text(aes(label=round(effective.library.size/1e6, 2)), vjust=-1, fontface=2)+
+    
+    xlab("Sample")+
+    ylab("Effective library size (n)")+
+    scale_fill_manual(values=diverge_hcl(12))+
+    
+    theme(axis.title = element_text(size=17, face="bold"), axis.text.x = element_text(size=7))+
+    annotate("text", x=6.6, y=2.5e7, label=paste("Largest to smallest effective library size ratio:\n", toString(round(max(DT_meta_data[,effective.library.size])/min(DT_meta_data[,effective.library.size]),2))), fontface=2)
+  
+  return(library_size_plot_out)
+}
+
+#3. Applying voom (precision weights modelling of mean-variance relationship)
+DT_voom_raw <- voom(DT_read_count_filtered[,-(1:2)], lib.size = DT_meta_data[,effective.library.size], save.plot = T)
+
+#4. Fit a linear model for each gene
+DT_vfit <- lmFit(DT_voom_raw$E, design = DT_design, weights = DT_voom_raw$weights)
+
+#5. Calculate coefficients and standard errors for each linear model (i.e. gene)
+DT_vfit <- contrasts.fit(DT_vfit, contrasts = DT_contrast)
+
+#6. Calculate moderated F & t-statistics, log odds of differential expression using emiprical Bayes moderation for each linear model (i.e. gene)
+DT_efit <- eBayes(DT_vfit)
+
+#7. Creating a DT_efit object using limma-trend instead of voom trend
+DT_vfit_limmaTrend <- lmFit(DT_lcpm[,-(1:2)], design=DT_design)
+DT_vfit_limmaTrend <- contrasts.fit(DT_vfit_limmaTrend, contrasts = DT_contrast)
+DT_efit_limmaTrend <- eBayes(DT_vfit_limmaTrend)
+
+#8. Plotting mean-variance plot for voom
+DT_voom_plotdata <- data.table(log.cpm=DT_voom_raw$voom.xy$x,quarter.var=DT_voom_raw$voom.xy$y)
+DT_efit_plotdata <- data.table(Amean=DT_efit$Amean, log2.sigma=log2(DT_efit$sigma))
+
+voom_plot <- ggplot(DT_voom_plotdata, aes(log.cpm, quarter.var))+
+  geom_point(alpha=0.3)+
+  geom_smooth(method="loess", color="red", se=F, linetype=2, size=1.5)+
+  
+    ylab("Sqrt (St.Dev)")+
+  
+  scale_x_continuous(breaks=seq(0,18,2))+
+  scale_y_continuous(breaks=seq(0,3,0.5), limits=c(0.25,2.5))+
+
+  theme(axis.title.y = element_text(face="bold", size=17), axis.title.x = element_blank())+
+  annotate("text", x=0, y=2.5, label="A", size=7.5, fontface=2)
+
+bayes_plot <- ggplot(DT_efit_plotdata, aes(Amean, log2.sigma))+
+  geom_point(alpha=0.3)+
+  geom_smooth(method="loess", color="red", se=F, linetype=2, size=1.5)+
+  geom_segment(aes(x=-3.5, xend=14.5, y=mean(DT_efit_plotdata[,log2.sigma], na.rm=T), yend=mean(DT_efit_plotdata[,log2.sigma], na.rm=T)), color="dodgerblue2", size=1.5, alpha=0.5)+
+  
+  ylab("log2 (St.Dev)")+
+  
+  scale_x_continuous(breaks=seq(-2,14,2))+
+  scale_y_continuous(breaks=seq(-4,4,0.5), limits=c(-2.5,2.5))+
+
+  theme(axis.title.y = element_text(face="bold", size=17), axis.title.x = element_blank())+
+  annotate("text", x=-3.5, y=2.5, label="B", size=7.5, fontface=2)
+
+###SECTION OUTPUT
+grid.arrange(voom_plot, bayes_plot, ncol=2, nrow=1, bottom=textGrob("Average log-CPM", gp=gpar(fontsize=17, fontface="bold")))
+```
+
+**Fig 10.** _Figure reports the mean-variance relationship pre -and post application of the voom function. Fig 9A reports the average log-CPM against the quarter root of the variance. Fig 9B reports average log-CPM against the log2(st.dev). Blue line reports the average log2(st.dev). The red line is a linear trend fitted to the black dots. Each black dot represents a gene. Fig 9A illustrates that the variance is decresing when the average expression is increasing. In Fig 9B the dependency is removed and the mean variance is unchanged when the average expression increases._      
+
+***
+
+# Differential Gene Expression
+**Determining significant gene differential expression for a contrast:** A simple Bayesian model is used for moderating standard errors across genes (squeeze them towards a common value) and producing moderated t-statistics. These moderated t-statistics are used for significance analysis. Moderated t-statistics have a higher degree of freedom in comparison to usual t-statistics due to the increase in reliability resulting from the smoothening of standard errors. P-values are adjusted for multiple testing using Benjamini and Hochberg's method to control for false discovery rate (FDR). 
+
+**Fig 11. Number of differentially expressed genes for each contrast**
+
+```{r echo=F, warning=F, message=F, error=F, fig.show='hide'}
+#1. Summarizing the number of up - and downregulated differentially expressed genes
+DT_dge <- decideTests(DT_efit, adjust.method = "BH")
+
+#2. Converting DT_dge into logical (-1 and 1 is TRUE and 0 is FALSE) 
+venn_data_logical <- do.call(cbind,lapply(data.table(DT_dge), function(column){column!=0}))
+
+#3. Function for retrieving data to add to venndiagram
+venn_data_function <- function(data.set, c1=NULL, c2=NULL, c3=NULL, c4=NULL){
+  out <- sum(rowSums(data.set[,c(c1, c2, c3, c4)]) %in% length(c(c1, c2, c3, c4)))
+  return(out)
+}
+
+#4. Venn diagram: injured only 
+venn_plot_injured <- invisible(draw.quad.venn(sum(venn_data_logical[,1]), 
+               sum(venn_data_logical[,2]), 
+               sum(venn_data_logical[,3]), 
+               sum(venn_data_logical[,4]),
+               venn_data_function(venn_data_logical,1,2),
+               venn_data_function(venn_data_logical,1,3),
+               venn_data_function(venn_data_logical,1,4),
+               venn_data_function(venn_data_logical,2,3),
+               venn_data_function(venn_data_logical,2,4),
+               venn_data_function(venn_data_logical,3,4),
+               venn_data_function(venn_data_logical,1,2,3),
+               venn_data_function(venn_data_logical,1,2,4),
+               venn_data_function(venn_data_logical,1,3,4),
+               venn_data_function(venn_data_logical,2,3,4),
+               venn_data_function(venn_data_logical,1,2,3,4),
+               category=c("Injury-\nSyngeneic", "Injury-\nAllogenic", "Injury-\nUninjured", "Syngeneic-\nAllogenic"),
+               lwd=c(2,2,6,2),
+               fill=brewer.pal(11,"RdBu")[c(2,4,9,11)],
+               alpha=0.7,
+               cex=2,
+               cat.cex=1.5,
+               cat.col= brewer.pal(11,"RdBu")[c(2,4,9,11)],
+               cat.fontface=2,
+               cat.just=list(c(0.25,-0.15),c(0.5,-0.15),c(0.9,-0.15), c(1,-0.15)),
+               cat.default.pos = "text"
+               ))
+
+#5. Venn diagram: injured+treatment vs uninjured 
+
+venn_plot_uninjured <- invisible(draw.triple.venn(sum(venn_data_logical[,3]), 
+               sum(venn_data_logical[,5]), 
+               sum(venn_data_logical[,6]), 
+               venn_data_function(venn_data_logical,3,5),
+               venn_data_function(venn_data_logical,5,6),
+               venn_data_function(venn_data_logical,3,6),
+               venn_data_function(venn_data_logical,3,5,6),
+               category=c("Injury-\nUninjured", "Syngeneic-\nUninjured","Allogenic-\nUninjured"),
+               lwd=c(2,2,2),
+               fill=brewer.pal(11,"RdBu")[c(2,4,9)],
+               alpha=0.7,
+               cex=2,
+               cat.cex=1.5,
+               cat.col=brewer.pal(11,"RdBu")[c(2,4,9)],
+               cat.fontface=2,
+               cat.just=list(c(0.25,-2),c(0.75,-2),c(0.5,2.2)),
+               cat.default.pos = "text",
+               margin=c(0.1)
+               ))
+
+
+```
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6, fig.align='center'}
+###SECTION OUTPUT
+grid.arrange(arrangeGrob(gTree(children=venn_plot_injured), left=textGrob("A", gp=gpar(fontface="bold", fontsize=20), vjust=-13)), arrangeGrob(gTree(children=venn_plot_uninjured), left=textGrob("B", gp=gpar(fontface="bold", fontsize=20), vjust=-13)), ncol=2)
+```
+
+**Fig 11.** _Figure reports venn diagrams containing the number of differentially expressed genes for each contrast. Fig 10A reports the number of differentially expressed genes for study groups which received a SCI while Fig 10B reports the study groups in relation to the uninjured samples._
+
+**Table 3. Number of differentially over -and under expressed genes for each contrast **
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=15, fig.height=6, fig.align='center'}
+#Summary table
+DT_dge_summary <- as.data.frame.matrix(summary(DT_dge))
+rownames(DT_dge_summary) <- c("Downregulated:", "No change", "Upregulated:")
+kable(DT_dge_summary, col.names = c("Injury-Syngeneic", "Injury-Allogenic", "Injury-Uninjured", "Syngeneic-Allogenic", "Syngeneic-Uninjured","Allogenic-Uninjured"), align="c")
+```
+
+**Fig 12. Mean difference -and volcano plot**
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=13, fig.height=5}
+#1. Creating plotting data for mean-difference plot
+DT_mean_difference <- data.table(toptable(DT_efit, coef=4, number=Inf, genelist = DT_read_count_filtered[,SYMBOL], A=DT_efit$Amean))
+
+DT_mean_difference <- DT_mean_difference[!is.na(ID)]
+
+#2. Plotting mean-difference
+mean_difference_plot <- ggplot(DT_mean_difference[logFC<=1 & logFC>=(-1)], aes(AveExpr,logFC))+
+  geom_jitter(alpha=0.7, size=3)+
+  geom_jitter(DT_mean_difference[(logFC<=(-1) | logFC >=1) & adj.P.Val>0.05], mapping=aes(AveExpr, logFC), color="dodgerblue4", alpha=0.8, size=3)+
+  geom_jitter(DT_mean_difference[(logFC<=-1 | logFC>=1) & adj.P.Val<0.05], mapping=aes(AveExpr, logFC), color="red", alpha=0.8, size=3)+
+  geom_segment(aes(x=-5, xend=15, y=-1,yend=-1), size=1.5, color="dodgerblue2", linetype=2)+
+  geom_segment(aes(x=-5, xend=15, y=1,yend=1), size=1.5, color="dodgerblue2", linetype=2)+
+  
+  annotate("text", x=12, y=2.5, label=nrow(DT_mean_difference[logFC >=1 & adj.P.Val>0.05]), color="dodgerblue4", fontface=2, alpha=0.8, size=4.5)+
+    annotate("text", x=12, y=-2.5, label=(nrow(DT_mean_difference[logFC<=-1 & adj.P.Val>0.05])+2), color="dodgerblue4", fontface=2, alpha=0.8, size=4.5)+
+
+  annotate("text", x=12, y=-2, label=(nrow(DT_mean_difference[logFC<=-1 & adj.P.Val<0.05])+2), color="red", fontface=2, alpha=0.8, size=4.5)+
+  annotate("text", x=12, y=2, label=nrow(DT_mean_difference[logFC>=1 & adj.P.Val<0.05]), color="red", fontface=2, alpha=0.8, size=4.5)+
+
+  annotate("text", x=12, y=1.5, label=nrow(DT_mean_difference[logFC>=1]), color="grey", fontface=2, size=4.5)+
+  annotate("text", x=12, y=-1.5, label=(nrow(DT_mean_difference[logFC<=-1])+4), color="grey", fontface=2, size=4.5)+
+  
+  scale_x_continuous(breaks=seq(-5,15,1))+
+  scale_y_continuous(breaks=seq(-6,3,1))+
+  
+  xlab("Average log-CPM")+
+  ylab("Log2(fold change)")+
+  
+  annotate("text", x=5, y=3, label="OVEREXPRESSED", fontface=2, alpha=0.6, size=4)+
+  annotate("text", x=5, y=-4, label="UNDEREXPRESSED", fontface=2, alpha=0.6, size=4)+
+  annotate("text", x=-5, y=3, label="A", fontface=2, size=7.5)+
+  
+  theme(axis.title = element_text(face="bold", size=17))
+
+#Volcano plot
+#1. Extracting log odds (i.e. -log10(p.value))
+volcano_temp <- data.table(DT_read_count_filtered[,SYMBOL], DT_efit$lods[,4])
+names(volcano_temp) <- c("ID","log.odds")
+volcano_temp <- volcano_temp[!is.na(ID)]
+
+#2. Merging log odds with logFc and adj.P.val data for plotting
+DT_volcano <- merge(DT_mean_difference, volcano_temp, by="ID")
+
+#3. Plotting function for volcano plot
+volcano_plot <- ggplot(DT_volcano,aes(logFC,log.odds))+
+  geom_jitter(alpha=0.7, size=3)+
+  geom_jitter(DT_volcano[adj.P.Val<0.05 & (logFC<1 | logFC>1)], mapping=aes(logFC, log.odds), color="red", alpha=0.8, size=3)+
+  geom_segment(aes(x=-1, xend=-1, y=-8,yend=8), size=1.5, color="dodgerblue2", linetype=2)+
+  geom_segment(aes(x=1, xend=1, y=-8,yend=8), size=1.5, color="dodgerblue2", linetype=2)+
+  geom_segment(aes(x=-7, xend=6, y=1, yend=1), size=0.5, color="dodgerblue2")+
+  
+  geom_text_repel(DT_volcano[adj.P.Val<0.05 & (logFC<1 | logFC>1)][1:10], mapping=aes(label=ID), size = 3.5,  box.padding = unit(0.75, "lines"), point.padding = unit(0.1, "lines"), fontface=2, nudge_y = 1)+
+  
+  scale_y_continuous(breaks=seq(-8,8,1))+
+  scale_x_continuous(breaks=seq(-7,6,1), limits=c(-7,6))+
+  
+  ylab("-log10(p.value)")+
+  xlab("Log2(fold change)")+
+  
+  annotate("text", x=4, y=8, label="OVEREXPRESSED", fontface=2, alpha=0.6, size=6)+
+  annotate("text", x=-4, y=8, label="UNDEREXPRESSED", fontface=2, alpha=0.6, size=6)+
+  annotate("text", x=-7, y=8, label="B", fontface=2, size=7.5)+
+  
+  theme(axis.title = element_text(face="bold", size=22))
+
+####SECTION OUTPUT
+plot_grid(mean_difference_plot, volcano_plot)
+
+# ggsave("mean_difference_plot.jpg",mean_difference_plot, dpi=1000, height=7, width=14)
+# ggsave("volcano_plot.jpg",volcano_plot, dpi=1000, height=7, width=14)
+
+```
+
+**Fig 12.** _Figure 11A reports a mean-difference plot which illustrates the number of over -and under expressed genes. Threshold is set at log2(fold change) +/-1 (blue lines). Blue dots represents genes above or below the log-fold change thresholds while red dots represent those genes which are above/below th thresholds and are significantly differentially expressed. Fig 11B is a volcano plot which reports the number of significantly over -and underexpressed genes (marked with red). Data in both plots is for the contrast "syngeneic IDmBMSC vs allogenic IDmBMSC"._
+
+**Table 4. 10 most significantly up -and downregulated differentially expressed genes**
+```{r echo=F, warning=F, message=F, error=F}
+#Retrieving logFc and associated p-values for all genes
+top_20_dge_retreiver <- function(dge.data, n, p.val.cutoff){
+  top_20_dge_out <- data.table(toptable(dge.data, coef=4, number=Inf, genelist = DT_read_count_filtered[,ifelse(is.na(SYMBOL),ENSEMBL_ID, SYMBOL)]))
+  top_20_dge_out <- top_20_dge_out[,.(ID, logFC=round(logFC,2), adj.P.Val=round(adj.P.Val, 4))]
+  top_20_dge_out <- data.table(top_20_dge_out[logFC<-1 & adj.P.Val<p.val.cutoff][1:n], top_20_dge_out[logFC>1 & adj.P.Val<p.val.cutoff][1:n])
+  return(top_20_dge_out)
+}
+
+###SECTION OUTPUT
+kable(top_20_dge_retreiver(DT_efit,10,0.05), align="c", col.names = rep(c("Gene", "log2(fold change)","P-value (adjusted)"),2))
+```
+
+***
+
+#Gene Ontology and KEGG Enrichment Analysis
+
+**Gene Ontology (GO):** A major bioinformatics initiative which offers a computational representation of the biological function of genes at molecular, cellular and tissue level. This tool enables one to annotate genes with their function. 
+
+**KEGG (Kyoto Encyclopedia of Genes and Genomes):** KEGG pathway are manually drawn pathway maps which represent the current knowledge within metabolism, cellular processes and many more.  
+
+**Fig 13. Top 10 enrichment terms/pathways**
+
+```{r echo=F, warning=F, message=F, error=F,fig.width=17, fig.height=7}
+#1. Getting ENTREZ IDs for all genes in the filtered read count matrix 
+entrez_ID <- data.table(select(Mus.musculus, keys=DT_read_count_filtered[,as.character(ENSEMBL_ID)], columns="ENTREZID", keytype = "ENSEMBL"))
+
+#2. Removing duplicates
+entrez_ID <- entrez_ID[!duplicated(ENSEMBL)]
+
+#3. Gene ontology enrichment analysis
+DT_GO <- goana(DT_efit, coef=4, geneid = entrez_ID[,as.character(ENTREZID)], FDR=0.05, species="Mm")
+DT_GO_top <- data.table(topGO(DT_GO, sort="down", n=10))
+
+#4. KEGG pathway enrichment analysis
+DT_KEGG <- kegga(DT_efit, coef=4, geneid = entrez_ID[,as.character(ENTREZID)], FDR=0.05, species="Mm")
+DT_KEGG_top <- data.table(topKEGG(DT_KEGG, sort="down", n=10))
+
+#5. Plotting function for GO (term) and KEGG (pathway)
+enrichment_plot_function <- function(data.set, yvariable, plot.title){
+  data.set <- data.set[order(Down)]
+  data.set[,yvariable] <- factor(data.set[,get(yvariable)], levels=unique(data.set[,get(yvariable)]))
+  
+  enrichment_plot_out <- ggplot(data.set, aes(get(yvariable), Down, fill=get(yvariable)))+
+  geom_bar(stat = "identity", show.legend = F, alpha=0.7)+
+  coord_flip()+
+  geom_text(aes(y=0.5, label=data.set[,get(yvariable)]), hjust=0, fontface=2, size=3)+
+  geom_text(aes(label=format(P.Down, scientific = T, digits = 2)), fontface=2, hjust=-0.2, size=3)+
+    
+  ylab("Number of donw regulated genes (n)")+
+  ggtitle(plot.title)+
+
+  scale_y_continuous(breaks=seq(0,100,5), limits=c(0,37))+
+  scale_fill_manual(values=brewer.pal(11,"RdBu")[c(10:1)])+
+    
+  theme(axis.text.y=element_blank(), axis.title = element_blank(), axis.ticks.y = element_blank(), axis.line.y = element_blank(), axis.line.x = element_blank(), axis.ticks.x = element_blank(), plot.title = element_text(size=20))
+  
+  if(yvariable=="Pathway"){
+    enrichment_plot_out <- enrichment_plot_out + scale_y_continuous(breaks=seq(0,15,1), limits=c(0,17))
+  }
+  
+  return(enrichment_plot_out)
+}
+
+####SECTION OUTPUT
+grid.arrange(arrangeGrob(enrichment_plot_function(DT_GO_top, "Term", "GO term"), left=textGrob("A", gp=gpar(fontface="bold", fontsize=20), vjust=-14)), arrangeGrob(suppressMessages(enrichment_plot_function(DT_KEGG_top, "Pathway", "KEGG pathway")), left=textGrob("B", gp=gpar(fontface="bold", fontsize=20), vjust=-14)), ncol=2, nrow=1, bottom=textGrob("Down regulated genes (n)", gp=gpar(fontface="bold", fontsize=17)))
+
+# #Saving
+# ggsave("GO.jpg", enrichment_plot_function(DT_GO_top, "Term", "GO term"), dpi=1000, height=7, width=7)
+# ggsave("KEGG.jpg", enrichment_plot_function(DT_KEGG_top, "Pathway", "KEGG pathway"), dpi=1000, height=7, width=7)
+
+```
+
+**Fig 13. ** _Figure reports gene ontology (GO) and Kyoto Encyclopedia of Genes and Genomes (KEGG) enrichment analysis. Top 10 enrichment IDs (term and pathway respectively) are reported. Horizontal axis represents the number of differentially expressed genes associated with each ID. Values indicate the p-value for each ID respectively._
+
+***
+
+# Unsupervised Clustering 2
+
+##Agglomerative hierarchical clustering with heat map
+
+**Background:** Purpose of hierarchical clustering in combination with heatmap is to find subset of genes which explain the difference between study groups.
+
+**Hierarchical clustering:** An unsupervised statistical learning method which aims at clustering the data in a not pre-determined amount of clusters. In agglomerative hierarchical clustering the tree is built from the terminal nodes (leaves) towards the root. A dendrogram is utilized to displayed the clusterings. A heatmap is added to the hierarchical clustering to enable the identification of gene clusters which might explain the  hierarchical clustering. 
+
+**Fig 14. Hierarchical clustering of samples together with heatmap of significantly differentially expressed genes **
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=30, fig.height=30}
+#1. Subsetting data up to 100 most significant DE genes between allogenic and syngeneic (coef=4)
+DT_logFC <- data.table(toptable(DT_efit, coef=4, number=Inf, genelist = DT_read_count_filtered[,ENSEMBL_ID]))
+DT_logFC <- merge(DT_logFC, DT_read_count[,.(ENSEMBL_ID, SYMBOL)], by.x="ID", by.y="ENSEMBL_ID")
+DT_logFC_significant <- DT_logFC[adj.P.Val<0.05]
+setcolorder(DT_logFC_significant, c(1,7,2:6))
+DT_logFC_significant[,"SYMBOL"] <- DT_logFC_significant[,.(ifelse(is.na(SYMBOL), ID, SYMBOL))]
+#2. Retrieving the most significant genes from the log CPM matrix (i.e. heatmap is constructed using log CPm values)
+DT_logFC_significant_lcpm <- DT_lcpm[DT_lcpm[,ENSEMBL_ID] %in% DT_logFC_significant[,ID]]
+
+#3. Heatmap function
+dev.off()
+heatmap_plot_function <- function(heatmap.data, col.height, column.labels, dendrogram.setting, row.labels){
+    heatmap.data <- data.matrix(heatmap.data)
+    heatmap_plot_out <- heatmap.2(heatmap.data,
+            scale="row",
+            trace="none",
+            density.info="none",
+            dendrogram=dendrogram.setting,
+            key=F,
+            
+            col=brewer.pal(11,"RdBu")[c(11:1)], 
+            labRow = row.labels,
+            labCol=column.labels,
+            cexCol = 3,
+            cexRow = 2,
+            offsetRow = 0.1,
+            offsetCol = 0.1,
+            
+            margin=c(19,20),
+            lhei=c(col.height,10),
+            lwid=c(0.5,3))
+  
+    invisible(heatmap_plot_out)  
+}
+
+#4. Calculating p-value for hierarchical clustering
+DT_hierarchical_clust <- data.matrix(DT_logFC_significant_lcpm[,c(3:14)])
+colnames(DT_hierarchical_clust) <- DT_meta_data[,sample]
+DT_hierarchical_clust_boot <- pvclust(DT_hierarchical_clust, quiet = T)
+
+###SECTION OUTPUT
+heatmap_plot_function(DT_logFC_significant_lcpm[,c(3:14)],2,DT_meta_data[,sample],"both", DT_logFC_significant_lcpm[,as.character(ifelse(is.na(SYMBOL), ENSEMBL_ID, SYMBOL))])
+
+# #Saving
+# jpeg('heatmap.jpg',
+#      width=2000,
+#      height=2000,
+#      quality=1000)
+# heatmap_plot_function(DT_logFC_significant_lcpm[,c(3:14)],2,DT_meta_data[,sample],"both", DT_logFC_significant_lcpm[,as.character(ifelse(is.na(SYMBOL), ENSEMBL_ID, SYMBOL))])
+# 
+# dev.off()
+
+```
+
+**Fig 14.** _Figure reports a heat map with hierarchical clustering (indicated with dendrograms) using log-CPM values. Only significantly differentially expressed genes are included (and genes with NA symbols were removed). A cluster in the top 10 rows is visible. In this cluster the allogenic IDmBMSCs cause the genes to be up-regulated, injury causes them to be somewhat up-regulated while syngeneic IDmBMSCs causes the lowest amount of up-regulation with a tendency towards down regulation. Thus syngeneic IDmBMSC is most similar to uninjured animals._ 
+
+## Multiscale bootstrap resampling of agglomerative hierarchical clustering
+
+**Fig 15. Multiscale bootstrap resampling of hierarchical clustering **
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=10, fig.height=7}
+plot(DT_hierarchical_clust_boot, print.pv=T, float=-0.02, col.pv=c("darkred", "darkblue"), cex.pv=0.9, font.pv=2, print.num=F,main="", sub="", xlab="")
+pvrect(DT_hierarchical_clust_boot)
+```
+
+**Fig 15.** _Figure reports hierarchical clustering using multiscale boostrap resampling with 1000 replicates. Numbers with red color are the approximately unbiased (AU) p-values while blue numbers represent bootstrap probability (BP). AU >95 and BP >70 are considered to be significant clusters. Red boxes indicate clusters with AU >95._
+
+**Fig 16. Unsupervised clustering using the 1000 genes with the highest F value (between all contrasts)**
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=5}
+#1. Calculating F-statistica
+DT_toptableF <- data.table(topTableF(DT_efit, number=Inf, genelist = DT_read_count_filtered[,SYMBOL]))
+#2. Subsetting the 500 genes with the highest F-statistica
+DT_toptableF <- DT_toptableF[!is.na(ProbeID)][1:1000, ProbeID]
+#3. Retrieving log-CPM values for the genes
+DT_toptableF <- DT_lcpm[DT_lcpm[,SYMBOL] %in% DT_toptableF]
+#4. Creating a dissimilarity structure
+DT_toptableF <- dist(t(DT_toptableF[,-(1:2)]))
+#5. Hierarchical clustering  
+DT_toptableF <- hclust(DT_toptableF)
+#6. Drawing the dendrogram
+myplclust(DT_toptableF, labels = paste(DT_meta_data[,group]," ","(", DT_meta_data[,RH.index], ")", sep=""), lab.col = brewer.pal(11,"RdBu")[c(1,2,10,11)][as.numeric(DT_meta_data[,group])], main=" ", ylab=" ", font=2, cex=1, hang=0.05)
+```
+
+**Fig 16.** _Figure reports a hierarchical clustering based on the 1000 genes with the highest F statistica (higher F statistica indicate a larger difference between contrasts). The conclusion is as for figure 8, i.e. that the injured animals do show similarites and that the 'intercept' between the syngeneic treated animals and the injury control is seems to ber present._
+
+## Description of function of 'cluster genes'
+
+**Apobec3:** Selectively targets single-stranded DNA and does not deaminate double-stranded DNA or single-or double-stranded RNA. Exhibits antiviral activity against HIV-1, simian immunodeficiency viruses (SIVs), mouse mammary tumor virus (MMTV) and friend murine leukemia virus (FrMLV) and may inhibit the mobility of LTR retrotransposons. _[ref: UniProt]_
+
+**Epsti1:**
+
+**Akna:** Transcription factor that specifically activates the expression of the CD40 receptor and its ligand CD40L/CD154, two cell surface molecules on lymphocytes that are critical for antigen-dependent-B-cell development. Binds to A/T-rich promoters. _[ref: UniProt]_
+
+**Itgal:** Involved in a variety of immune phenomena including leukocyte-endothelial cell interaction, cytotoxic T-cell mediated killing, and antibody dependent killing by granulocytes and monocytes. Contributes to natural killer cell cytotoxicity. Involved in leukocyte adhesion and transmigration of leukocytes including T-cells and neutrophils. _[ref: UniProt]_
+
+**Rac2:** Plasma membrane-associated small GTPase which cycles between an active GTP-bound and inactive GDP-bound state. In active state binds to a variety of effector proteins to regulate cellular responses, such as secretory processes, phagocytose of apoptotic cells and epithelial cell polarization. Augments the production of reactive oxygen species (ROS) by NADPH oxidase. _[ref: UniProt]_
+
+**H2-Q7:** Involved in the presentation of foreign antigens to the immune system. _[ref: UniProt]_
+
+**Sash3:** May function as a signaling adapter protein in lymphocytes. _[ref: UniProt]_
+
+**Psmb8:** The proteasome is a multicatalytic proteinase complex which is characterized by its ability to cleave peptides with Arg, Phe, Tyr, Leu, and Glu adjacent to the leaving group at neutral or slightly basic pH. The proteasome has an ATP-dependent proteolytic activity. This subunit is involved in antigen processing to generate class I binding peptides. May be involved in the inflammatory response pathway. Required for adipocyte differentiation. _[ref: UniProt]_
+
+**Irf1:** Transcriptional regulator which displays a remarkable functional diversity in the regulation of cellular responses. These include the regulation of IFN and IFN-inducible genes, host response to viral and bacterial infections, regulation of many genes expressed during hematopoiesis, inflammation, immune responses and cell proliferation and differentiation, regulation of the cell cycle and induction of growth arrest and programmed cell death following DNA damage. Stimulates both innate and acquired immune responses through the activation of specific target genes and can act as a transcriptional activator and repressor regulating target genes by binding to an interferon-stimulated response element (ISRE) in their promoters. Plays an important role in immune response directly affecting NK maturation and activity, macrophage production of IL12, Th1 development and maturation of CD8+ T-cells. Also implicated in the differentiation and maturation of dendritic cells and in the suppression of regulatory T (Treg) cells development. Its target genes for transcriptional activation activity are: genes invovled in immune response, such as IL7, IL12A/B and IL15, PTGS2/COX2 and CYBB; MHC class I expression, such as TAP1, PSMB9/LMP2, PSME1/PA28A, PSME2/PA28B and B2M and MHC class II expression, such as CIITA. _[ref: UniProt]_
+
+**Pik3cd:** PIP3 plays a key role by recruiting PH domain-containing proteins to the membrane, including AKT1 and PDPK1, activating signaling cascades involved in cell growth, survival, proliferation, motility and morphology. Mediates immune responses. Plays a role in B-cell development, proliferation, migration, and function. Required for B-cell receptor (BCR) signaling. Mediates B-cell proliferation response to anti-IgM, anti-CD40 and IL4 stimulation. Promotes cytokine production in response to TLR4 and TLR9. Required for antibody class switch mediated by TLR9. Involved in the antigen presentation function of B-cells. Involved in B-cell chemotaxis in response to CXCL13 and sphingosine 1-phosphate (S1P). Required for proliferation, signaling and cytokine production of naive, effector and memory T-cells. Required for T-cell receptor (TCR) signaling. Mediates TCR signaling events at the immune synapse. Activation by TCR leads to antigen-dependent memory T-cell migration and retention to antigenic tissues. Together with PIK3CG participates in T-cell development. Contributes to T-helper cell expansion and differentiation. Required for T-cell migration mediated by homing receptors SELL/CD62L, CCR7 and S1PR1 and antigen dependent recruitment of T-cells. Together with PIK3CG is involved in natural killer (NK) cell development and migration towards the sites of inflammation. Participates in NK cell receptor activation. Have a role in NK cell maturation and cytokine production. Together with PIK3CG is involved in neutrophil chemotaxis and extravasation. _[ref: UniProt]_
+
+***
+
+# Gene Set Testing
+
+##Molecular Signatures Database
+
+**Camera:** Performs a competitive gene set test which accounts for inter-gene correlations. Camera evaluates if a set of genes is highly ranked relative to other genes in terms of differential expression.  
+
+**Barcode plot:** This function plots two sets of genes in a ranked list of statistics. Statistics are ranked left to right from smallest to largest. Shaded region in the middle of the plot represents the ranked statistics while the vertical bars reports the positions of the specified subsets. The enrichment worm (line) shows the relative enrichment of the vertical bars in each part of the plot.  
+
+**Table 5. Significant and selected gene sets from MSigDB libraries** 
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+#1. Importing dataset
+sample_key_verification <- fread("genes_inflammation_macrophage_msc.csv")
+#2. Defininf function which takes a specified index and runs the 'camera' function and returns a data_table
+camera_function <- function(selected.index, type){
+  data_out <- camera(DT_voom_raw, index=selected.index, design=DT_design, contrast = DT_contrast[,4], inter.gene.cor = 0.01)
+  data_out <- data.table(GeneSet = rownames(data_out), Library=type, data_out)[,!"FDR"][,PValue:=format(PValue, digits=2, scientific=T)]
+  setkey(data_out, GeneSet)  
+  return(data_out)
+}
+
+#2. Creating indices
+#C2
+load(url("http://bioinf.wehi.edu.au/software/MSigDB/mouse_c2_v5p1.rdata"))
+geneset_index_c2 <- ids2indices(Mm.c2,id=rownames(DT_read_count_filtered)) 
+#C7
+load(url("http://bioinf.wehi.edu.au/software/MSigDB/mouse_c7_v5p2.rdata"))
+geneset_index_c7 <- ids2indices(Mm.c7,id=rownames(DT_read_count_filtered)) 
+#Hallmark
+load(url("http://bioinf.wehi.edu.au/software/MSigDB/mouse_H_v5p2.rdata"))
+geneset_index_hallmark <- ids2indices(Mm.H,id=rownames(DT_read_count_filtered)) 
+
+#Pro-inflammation and microglia
+pro_inflammation_index <- as.list(data.table(DT_lcpm[,ENSEMBL_ID] %in% sample_key_verification[experiment.type=="pro_inflammation",ENSEMBL_ID]))[[1]]
+microglia_index <- as.list(data.table(DT_lcpm[,ENSEMBL_ID] %in% sample_key_verification[experiment.type=="microglia",ENSEMBL_ID]))[[1]]
+
+#Selected and significant gene set from each 'library'
+c2_selected <- c("LINDSTEDT_DENDRITIC_CELL_MATURATION_B", "KEGG_B_CELL_RECEPTOR_SIGNALING_PATHWAY", "LEE_EARLY_T_LYMPHOCYTE_DN", "SANSOM_APC_TARGETS_DN", "COATES_MACROPHAGE_M1_VS_M2_UP", "COATES_MACROPHAGE_M1_VS_M2_DN")
+c7_selected <- c("GSE17186_MEMORY_VS_NAIVE_BCELL_DN", "GSE22886_NAIVE_CD4_TCELL_VS_MEMORY_TCELL_DN", "GSE22886_NAIVE_TCELL_VS_DC_UP", "GSE27786_CD8_TCELL_VS_NKCELL_UP", "GSE29949_MICROGLIA_BRAIN_VS_MONOCYTE_BONE_MARROW_UP", "GSE3982_DC_VS_BCELL_UP")
+hallmark_selected <- c("HALLMARK_INFLAMMATORY_RESPONSE", "HALLMARK_INTERFERON_GAMMA_RESPONSE")
+
+####SECTION OUTPUT
+kable(rbind(camera_function(geneset_index_c2, "C2")[c2_selected], camera_function(geneset_index_c7, "C7")[c7_selected], camera_function(geneset_index_hallmark, "Hallmark")[hallmark_selected]), align = c("l", rep("c",4)), col.names = c("Gene set", "MSigDB","Genes (n)", "Direction", "P-value"))
+```
+
+**Fig 17. Barcode plot of M1/M2 gene set (up and down) from MSigDB C2**
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+#1. Bar code plot for M1-M2 up and down (from C2)
+
+barcodeplot(DT_efit$t[,4], index = geneset_index_c2$COATES_MACROPHAGE_M1_VS_M2_UP, index2=geneset_index_c2$COATES_MACROPHAGE_M1_VS_M2_DN, main="M1/M2", cex.main=2)
+
+# jpeg('barcode_m1_m2.jpg',
+#      width=750,height=400, quality=1000)
+
+```
+
+**Fig 17.** _Figure reports a barcodeplot of gene set COATES\_MACROPHAGE\_M1\_VS\_M2\_UP (red bars, top of plot) and COATES\_MACROPHAGE\_M1\_VS\_M2\_DN (blue bars, bottom of plot). The M1/M2 UP is on the border of significance (visible by a one directional enrichment line) while M1/M2 DN is far from significant (visible by non-conclusive enrichment line). Thus there is support for the hypothesis that there is indeed a set of genes related to increase in M1/M2 ratio which are highly ranked in terms of differential expression relative to all other genes._
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+#1. Subsetting log CPM for pro-inflammatory genes
+DT_verification <- DT_lcpm[ENSEMBL_ID %in% sample_key_verification[, ENSEMBL_ID]]
+#2. Adding back experiment type
+DT_verification <- merge(DT_verification, sample_key_verification[,.(ENSEMBL_ID, experiment.type)], by="ENSEMBL_ID")
+#3. Melting data 
+DT_verification <- melt.data.table(DT_verification,id.vars=c("ENSEMBL_ID","SYMBOL", "experiment.type"), variable.name = "RH.index", value.name = "logCPM")
+#4. Merging with meta data 
+DT_verification <- merge(DT_verification, DT_meta_data[,.(RH.index, sample, group)], by="RH.index")
+#5. Removing group "uninjured" since it was not included in the PCR experiment
+DT_verification <- DT_verification[group!="uninjured"]
+#6. Plotting log CPM of pro-inflammatory genes
+gene_plot_function <- function(data.set, colorpalette){
+  gene_plot_out <- ggplot(data.set, aes(x=group, y=logCPM, fill=group, shape=group))+
+    geom_boxplot(show.legend = F, alpha=1, width=0.2)+
+    geom_point(show.legend = F, size=2)+
+
+    ylab("log CPM")+
+
+    scale_fill_manual(values=colorpalette)+
+    scale_y_continuous(breaks=seq(-10,10,0.5))+
+    scale_x_discrete(labels=c("Allogenic IDmBMSC", "Injury Control", "Syngeneic IDmBMSC", "Uninjured"))+
+
+    theme(axis.title.x = element_blank(), axis.text.x = element_text(size=7, face="bold"), strip.text = element_text(face="bold", size=13, color="white"), strip.background = element_rect(fill="black"))+
+    
+    facet_wrap(~SYMBOL, scales = "free")
+
+  return(gene_plot_out)
+}
+
+```
+
+## Gene Set: Pro-inflammation   
+
+**Fig 18. Genes specific for pro-inflammation**
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+gene_plot_function(DT_verification[experiment.type=="pro_inflammation"],brewer.pal(11,"RdBu")[c(2,4,10)])
+
+barcodeplot(DT_efit$t[,4], index=pro_inflammation_index, main="Pro-Inflammation", cex.main=2)
+
+suppressWarnings(kable(camera_function(pro_inflammation_index,"Custom")[,GeneSet:="Pro-Inflammation"], align=c("l", rep("c",4))))
+
+# jpeg('barcode_inflammation.jpg',
+#      width=750,height=400, quality=1000)
+```
+
+**Fig 18.** _Boxplots reports log-CPM values for genes associated with pro-inflammation which remained post filtering of lowly expressed genes. Genes are a subset of genes form the PCR experiment. Barcodeplot reports the enrichment of genes. Table reports p-value of competitive gene set testing. The boxplots, barcode plot and competitive gen set test confirms that pro-inflammatory genes are downregulated as a group (i.e. in animals which received syngeneic transplantation)._
+
+## Gene Set: Microglia
+
+**Fig 19. Genes specific for microglia**
+
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+gene_plot_function(DT_verification[experiment.type=="microglia"], brewer.pal(9, "Paired")[c(1,3,2)])
+
+barcodeplot(DT_efit$t[,4], index=microglia_index, cex.main=2, main="Microglia")
+
+suppressWarnings(kable(camera_function(microglia_index, "Custom")[,GeneSet:="Microglia"], align=c("l", rep("c",4))))
+
+# jpeg('barcode_microglia.jpg',
+#      width=750,height=400, quality=1000)
+```
+
+**Fig 19.** _Boxplots reports genes specific for microglia. Barcodeplot reports the enrichment of genes. Table reports p-value of competitive gene set testing. It is obvious that the expression of microglial genes is lower in mice which received syngeneic IDmBMSCs. This pattern seems to be correlated with the pattern found for pro-inflammatory genes in figure 18. The boxplots, barcode plot and competitive gen set test confirms that pro-inflammatory genes are downregulated as a group (i.e. in animals which received syngeneic transplantation)._      
+
+# Comparison with Published Data
+
+**Paper: Transcriptome profile of rat genes in injured spinal cord at different stages by RNA-sequencing (Shi et al. 2017)**  
+Authors induced a contusion spinal cord injury in rats and evaluated differential gene expression in animals sacrified at 1, 6 and 28 post injury. Sham animals were included as controls. Differential gene expression of animals at 28 days post injury were used as comparison to data obtained in our study.   
+
+**Table 6. Comparison of DEG, GO terms and KEGG pathway between Shi et al. 2017 and the current data (injury vs sham)**
+```{r echo=F, warning=F, message=F, error=F, fig.width=12, fig.height=6}
+#1 Importing data from shi et al. on differentially expressed up and downregulated genes
+DT_shi_deg <- fread("Shi_et_al_2017_sham_vs_injury_28days_DEG.csv")
+#2. Adjusting column names and NA values 
+setnames(DT_shi_deg, c("Ensembl Gene ID", "RGD Symbol"), c("ENSEMBL_ID", "Symbol"))
+DT_shi_deg[,"Symbol"] <- DT_shi_deg[,ifelse(Symbol=="-//-",NA,Symbol)]
+#3. Preparing our data for comparison
+DT_ramil_deg <- data.table(DT_read_count_filtered[,2],Direction = DT_dge[,3])[!is.na(SYMBOL)][Direction!=0]
+DT_ramil_deg[,"Direction"] <- DT_ramil_deg[,ifelse(Direction==1, "Up", "Down")]
+#4. Percentage match between our up -and downregulated genes with Shi et al.
+comparison_shi_ramil <- as.data.frame.matrix(table(DT_ramil_deg[,.(SYMBOL %in%DT_shi_deg[,Symbol]), by="Direction"]))
+comparison_shi_ramil <- sweep(comparison_shi_ramil,1, apply(comparison_shi_ramil,1,sum), "/")
+#5.GO terms
+DT_shi_go <- fread("Shi_et_al_2017_sham_vs_injury_28days_GO.csv")
+go_shi_ramil <- prop.table(table(DT_shi_go[Corrected_pValue<0.05, GO_accession] %in% rownames(DT_GO[DT_GO$P.Down<0.05 & DT_GO$Down >20,])))
+#6.KEGG
+DT_shi_kegg <- fread("Shi_et_al_2017_sham_vs_injury_28days_KEGG.csv", skip=4)
+kegg_shi_ramil <- prop.table(table(DT_KEGG[DT_KEGG$P.Down<0.05,"Pathway"] %in% DT_shi_kegg[1:276][`Corrected P-Value`<0.05,`#Term`]))
+
+####SECTION OUTPUT
+shi_ramil_out <- data.table(t(as.data.frame.matrix(rbind(comparison_shi_ramil, go_shi_ramil, kegg_shi_ramil))))
+shi_ramil_out <- data.table(Match=c("FALSE", "TRUE"),do.call(cbind,lapply(shi_ramil_out[,1:4],function(column){format(column, nsmall = 2, digits=2)})))
+names(shi_ramil_out) <- c("Match","DGE.Down", "DGE.Up", "GO.Term", "KEGG.Pathway")
+shi_ramil_out <- as.data.table(rbind(as.matrix(shi_ramil_out),t(as.matrix(c("SUM:",rep("1",4))))))
+
+kable(shi_ramil_out, align = c("l", rep("c",4)))
+```
+
+**Table 6.** _Table reports the fraction of matches (i.e. TRUE is the fraction matched and FALSE the fraction not matched) for differentially expressed genes (up and down), GO terms and KEGG pathway IDs. For the GO terms the number of genes was assumed to be >20 per term (to improve prerequisistes for comparison). Only genes, terms and pathways with p-value <0.05 were considered in the comparison. Considering that different contusion models were used (weight drop vs impactor), difference in time of evaluation (28 days vs 20 days post SCI) and different animal types (rat vs mouse) som significant similarites can be detected._
+
+#Summary
+
+**1. Annotation:** _Genes are annotated with gene name using their respective ENSEMBL ID._  
+**2. Transformation:** _Read count matrix is transformed into log-CPM using original library sizes._  
+**3. Filtering:** _Read count matrix is filtered using log-CPM values (>0 for at least 3 samples)._    
+**4. Normalization:** _Effective library sizes are calculated using the library sizes for the filtered read count matrix and the trimmed mean of M values (TMM) approach._    
+**5. Transformation:** _Filtered read count matrix is transformed into log-CPM matrix._    
+**6. PCA:** _Conducted for the 500 genes with highest variance. Proportional variance explained, MDS and loading plots are created._    
+**7. Design matrix:** _A dummy matrix which indicates which group each sample belongs._  
+**8. Contrast matrix:** _Contrasts are the group comparisons of interest._    
+**9. Voom transformation:** _Estimate precision weights for linear modelling to remove dependency between the variance and trhe mean._  
+**10. Linear modelling:** _Linear modelling using precision weights followed by an empirical Bayes moderation._  
+**11. Differentially expressed genes:** _Moderated t-statistics are used for determining significantly expressed genes for each contrast. Results are displayed with venn diagrams, mean-difference -and volcano plot and a summary table._  
+**12. Analysis/interpretation:** _Using hierarchical clustering, heatmap, gene ontology and KEGG enrichment analysis and gene set analysis the difference between the study groups is sought for._   
+
+# Bibliography
+
+**[1]** _R Core Team (2016). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria. URL htts://www.R-project._
+
+**[2]** _Ritchie, M.E., Phipson, B., Wu, D., Hu, Y., Law, C.W., Shi, W., and Smyth, G.K. (2015). limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Research 43(7), e47._
+
+**[3]** _Robinson MD, McCarthy DJ and Smyth GK (2010). edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. Bioinformatics 26, 139-140_
+
+**[4]** _Law CW, Alhamdoosh M, Su S et al. RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR [version 1; referees: 3 approved]. F1000Research 2016, 5:1408._
+
+# Setup
+
+This analysis was conducted on:
+
+```{r echo=T, warning=F, message=F, error=F}
+sessionInfo()
+```
